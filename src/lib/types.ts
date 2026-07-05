@@ -68,6 +68,36 @@ export interface PositionEntry {
   date: string;
 }
 
+export interface PitStop {
+  session_key: number;
+  driver_number: number;
+  lap_number: number | null;
+  pit_duration: number | null;
+  date: string;
+}
+
+export interface WeatherSample {
+  date: string;
+  air_temperature: number;
+  track_temperature: number;
+  humidity: number;
+  pressure: number;
+  rainfall: number;
+  wind_speed: number;
+  wind_direction: number;
+}
+
+export interface RaceControlMsg {
+  date: string;
+  category: string | null;
+  flag: string | null;
+  scope: string | null;
+  sector: number | null;
+  driver_number: number | null;
+  lap_number: number | null;
+  message: string;
+}
+
 export interface LocationSample {
   date: string;
   driver_number: number;

@@ -8,6 +8,7 @@ import {
   type DriverChannels,
 } from "@/lib/telemetry";
 import { buildColorMap, fmtLap, teamColor } from "@/lib/format";
+import { fetchJson } from "@/lib/useApi";
 import type { CarSample, Driver, Lap, Session } from "@/lib/types";
 
 const telemCache = new Map<string, CarSample[]>();
@@ -87,12 +88,10 @@ export default function TelemetryTab({
             `/api/openf1/car_data?session_key=${session.session_key}` +
             `&driver_number=${driver.driver_number}` +
             `&date>=${encodeURIComponent(start)}&date<${encodeURIComponent(end)}`;
-          const res = await fetch(url);
-          if (!res.ok) throw new Error(`telemetry request failed (${res.status})`);
-          samples = (await res.json()) as CarSample[];
+          samples = await fetchJson<CarSample[]>(url);
           telemCache.set(key, samples);
         }
-        const channels = integrate(samples);
+        const channels = integrate(samples, Date.parse(lap.date_start!));
         if (!channels) {
           throw new Error(
             `no car data for ${driver.name_acronym} lap ${lap.lap_number}`,

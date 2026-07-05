@@ -9,6 +9,7 @@ import type { CarSample } from "./types";
 export interface DriverChannels {
   maxDist: number;
   dist: number[];
+  time: number[];
   speed: number[];
   throttle: number[];
   brake: number[];
@@ -18,6 +19,7 @@ export interface DriverChannels {
 }
 
 export interface AlignedChannels {
+  time: (number | null)[];
   speed: (number | null)[];
   throttle: (number | null)[];
   brake: (number | null)[];
@@ -28,14 +30,24 @@ export interface AlignedChannels {
 
 const DRS_ON = new Set([10, 12, 14]);
 
-export function integrate(samples: CarSample[]): DriverChannels | null {
+export function integrate(
+  samples: CarSample[],
+  startMs?: number,
+): DriverChannels | null {
   const pts = samples
     .map((s) => ({ ...s, t: Date.parse(s.date) }))
     .filter((s) => Number.isFinite(s.t))
     .sort((a, b) => a.t - b.t);
   if (pts.length < 2) return null;
 
-  const dist: number[] = [0];
+  // Anchor to the lap start when given: the first sample lands up to ~270ms
+  // after the line, and that offset differs per car — without this, two
+  // drivers' time/distance bases disagree and cross-car deltas skew.
+  const t0 = startMs != null && Number.isFinite(startMs) ? startMs : pts[0].t;
+  const headStart = Math.max(0, (pts[0].t - t0) / 1000);
+
+  const dist: number[] = [(pts[0].speed / 3.6) * headStart];
+  const time: number[] = [(pts[0].t - t0) / 1000];
   const speed: number[] = [pts[0].speed];
   const throttle: number[] = [pts[0].throttle];
   const brake: number[] = [pts[0].brake];
@@ -43,12 +55,13 @@ export function integrate(samples: CarSample[]): DriverChannels | null {
   const gear: number[] = [pts[0].n_gear];
   const drs: number[] = [DRS_ON.has(pts[0].drs) ? 1 : 0];
 
-  let d = 0;
+  let d = dist[0];
   for (let i = 1; i < pts.length; i++) {
     // clamp dt so a data gap doesn't teleport the car down the road
     const dt = Math.min(Math.max((pts[i].t - pts[i - 1].t) / 1000, 0), 2);
     d += ((pts[i].speed + pts[i - 1].speed) / 2 / 3.6) * dt;
     dist.push(d);
+    time.push((pts[i].t - t0) / 1000);
     speed.push(pts[i].speed);
     throttle.push(pts[i].throttle);
     brake.push(pts[i].brake);
@@ -56,7 +69,7 @@ export function integrate(samples: CarSample[]): DriverChannels | null {
     gear.push(pts[i].n_gear);
     drs.push(DRS_ON.has(pts[i].drs) ? 1 : 0);
   }
-  return { maxDist: d, dist, speed, throttle, brake, rpm, gear, drs };
+  return { maxDist: d, dist, time, speed, throttle, brake, rpm, gear, drs };
 }
 
 /**
@@ -74,6 +87,7 @@ export function align(
 
   const perDriver = channelsList.map((c) => {
     const out: AlignedChannels = {
+      time: [],
       speed: [],
       throttle: [],
       brake: [],
@@ -84,6 +98,7 @@ export function align(
     let j = 0;
     for (const x of xs) {
       if (x > c.maxDist) {
+        out.time.push(null);
         out.speed.push(null);
         out.throttle.push(null);
         out.brake.push(null);
@@ -98,6 +113,7 @@ export function align(
       const d1 = c.dist[j2];
       const f = d1 > d0 ? Math.min(Math.max((x - d0) / (d1 - d0), 0), 1) : 0;
       const lerp = (arr: number[]) => arr[j] + (arr[j2] - arr[j]) * f;
+      out.time.push(lerp(c.time));
       out.speed.push(lerp(c.speed));
       out.throttle.push(lerp(c.throttle));
       out.rpm.push(lerp(c.rpm));

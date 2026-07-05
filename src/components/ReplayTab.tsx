@@ -8,6 +8,15 @@ import {
   useState,
 } from "react";
 import { teamColor } from "@/lib/format";
+import { fetchJson } from "@/lib/useApi";
+import {
+  buildTrackModel,
+  drawBeacon,
+  drawCar,
+  drawTrack,
+  makeProjector,
+  type TrackModel,
+} from "@/lib/track3d";
 import type {
   CarSample,
   Driver,
@@ -19,20 +28,22 @@ import type {
 
 /**
  * Session replay: streams GPS positions in 2-minute chunks (a full race is
- * ~40MB, so we buffer around the playhead instead), animates cars on an SVG
- * track via rAF + imperative transforms, and samples car_data for the
- * focused driver's live gauge. React state only updates at ~4Hz for the
- * clock/leaderboard; the 60fps path never re-renders.
+ * ~40MB, so we buffer around the playhead instead), renders the circuit in
+ * 3D (real elevation from the z channel) on a canvas via rAF, and samples
+ * car_data for the focused driver's live gauge. React state only updates at
+ * ~4Hz for the clock/leaderboard; the 60fps path never re-renders.
  */
 
 const CHUNK_MS = 120_000;
 const SPEEDS = [1, 2, 5, 10, 25];
-const DRS_ON = new Set([10, 12, 14]);
+const CANVAS_H = 440;
+const DEFAULT_PITCH = 0.9;
 
 interface Pt {
   t: number;
   x: number;
   y: number;
+  z: number;
 }
 
 interface CarPt {
@@ -45,29 +56,23 @@ interface CarPt {
   drs: boolean;
 }
 
-interface Track {
-  path: string;
-  vb: string;
-  sf: [number, number];
-  toSvg: (x: number, y: number) => [number, number];
-}
-
+const DRS_ON = new Set([10, 12, 14]);
 const enc = encodeURIComponent;
 
 function samplePos(
   arr: Pt[] | undefined,
   prev: Pt[] | undefined,
   t: number,
-): { x: number; y: number; stale: boolean } | null {
+): { x: number; y: number; z: number; stale: boolean } | null {
   let a = arr;
   if ((!a || !a.length || t < a[0].t) && prev?.length) a = prev;
   if (!a || !a.length) return null;
   if (t <= a[0].t) {
-    return { x: a[0].x, y: a[0].y, stale: a[0].t - t > 5000 };
+    return { x: a[0].x, y: a[0].y, z: a[0].z, stale: a[0].t - t > 5000 };
   }
   const last = a[a.length - 1];
   if (t >= last.t) {
-    return { x: last.x, y: last.y, stale: t - last.t > 30_000 };
+    return { x: last.x, y: last.y, z: last.z, stale: t - last.t > 30_000 };
   }
   let lo = 0;
   let hi = a.length - 1;
@@ -79,11 +84,12 @@ function samplePos(
   const p0 = a[lo];
   const p1 = a[hi];
   // don't interpolate across data gaps (red flags, retirement, GPS dropout)
-  if (p1.t - p0.t > 5000) return { x: p0.x, y: p0.y, stale: true };
+  if (p1.t - p0.t > 5000) return { x: p0.x, y: p0.y, z: p0.z, stale: true };
   const f = (t - p0.t) / Math.max(p1.t - p0.t, 1);
   return {
     x: p0.x + (p1.x - p0.x) * f,
     y: p0.y + (p1.y - p0.y) * f,
+    z: p0.z + (p1.z - p0.z) * f,
     stale: false,
   };
 }
@@ -132,7 +138,7 @@ export default function ReplayTab({
   const t1 = useMemo(() => Date.parse(session.date_end), [session]);
   const durationS = Math.max(1, Math.floor((t1 - t0) / 1000));
 
-  const [track, setTrack] = useState<Track | null>(null);
+  const [track, setTrack] = useState<TrackModel | null>(null);
   const [trackErr, setTrackErr] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(5);
@@ -141,15 +147,19 @@ export default function ReplayTab({
   const [focus, setFocus] = useState<number | null>(null);
   const [showLabels, setShowLabels] = useState(true);
 
-  const trackRef = useRef<Track | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const camRef = useRef({ yaw: 0, pitch: DEFAULT_PITCH, zoom: 1 });
+  const dragRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
+  const hitRef = useRef(new Map<number, [number, number]>());
+  const trackRef = useRef<TrackModel | null>(null);
   const timeRef = useRef(t0);
   const playingRef = useRef(false);
   const speedRef = useRef(5);
   const focusRef = useRef<number | null>(null);
+  const labelsRef = useRef(true);
   const locChunks = useRef(new Map<number, Map<number, Pt[]>>());
   const carChunks = useRef(new Map<string, CarPt[]>());
   const inflight = useRef(new Set<string>());
-  const dotRefs = useRef(new Map<number, SVGGElement>());
   const gaugeRefs = useRef<{
     speed?: HTMLSpanElement | null;
     rpm?: HTMLSpanElement | null;
@@ -171,8 +181,11 @@ export default function ReplayTab({
   useEffect(() => {
     focusRef.current = focus;
   }, [focus]);
+  useEffect(() => {
+    labelsRef.current = showLabels;
+  }, [showLabels]);
 
-  // ---- track outline from the session's fastest lap ----
+  // ---- track model from the session's fastest lap ----
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -188,42 +201,15 @@ export default function ReplayTab({
         const end = new Date(
           Date.parse(start) + (ref.lap_duration! + 0.3) * 1000,
         ).toISOString();
-        const res = await fetch(
+        const rows = await fetchJson<LocationSample[]>(
           `/api/openf1/location?session_key=${session.session_key}` +
             `&driver_number=${ref.driver_number}` +
             `&date>=${enc(start)}&date<${enc(end)}`,
         );
-        if (!res.ok) throw new Error(`track outline request failed (${res.status})`);
-        const rows = (await res.json()) as LocationSample[];
-        const pts = rows.filter((r) => r.x !== 0 || r.y !== 0);
-        if (pts.length < 50) {
-          throw new Error("no GPS data published for this session");
-        }
-        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-        for (const p of pts) {
-          if (p.x < minX) minX = p.x;
-          if (p.x > maxX) maxX = p.x;
-          if (p.y < minY) minY = p.y;
-          if (p.y > maxY) maxY = p.y;
-        }
-        const W = 1000;
-        const pad = 60;
-        const scale = (W - 2 * pad) / Math.max(maxX - minX, 1);
-        const H = Math.ceil((maxY - minY) * scale + 2 * pad);
-        const toSvg = (x: number, y: number): [number, number] => [
-          pad + (x - minX) * scale,
-          H - (pad + (y - minY) * scale),
-        ];
-        const path =
-          pts
-            .filter((_, i) => i % 2 === 0)
-            .map((p, i) => {
-              const [sx, sy] = toSvg(p.x, p.y);
-              return `${i ? "L" : "M"}${sx.toFixed(1)},${sy.toFixed(1)}`;
-            })
-            .join("") + "Z";
+        const model = buildTrackModel(rows);
+        if (!model) throw new Error("no GPS data published for this session");
         if (alive) {
-          setTrack({ path, vb: `0 0 ${W} ${H}`, sf: toSvg(pts[0].x, pts[0].y), toSvg });
+          setTrack(model);
           setTrackErr(null);
         }
       } catch (e) {
@@ -254,7 +240,7 @@ export default function ReplayTab({
         const m = new Map<number, Pt[]>();
         for (const r of rows) {
           if (r.x === 0 && r.y === 0) continue;
-          const p = { t: Date.parse(r.date), x: r.x, y: r.y };
+          const p = { t: Date.parse(r.date), x: r.x, y: r.y, z: r.z ?? 0 };
           const arr = m.get(r.driver_number);
           if (arr) arr.push(p);
           else m.set(r.driver_number, [p]);
@@ -307,7 +293,25 @@ export default function ReplayTab({
     void loadLocChunk(0);
   }, [loadLocChunk]);
 
-  // ---- 60fps playback loop (no React re-renders in here) ----
+  // wheel zoom must be a non-passive listener to preventDefault
+  useEffect(() => {
+    const cv = canvasRef.current;
+    if (!cv) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const c = camRef.current;
+      c.zoom = Math.min(3.5, Math.max(0.5, c.zoom * (e.deltaY > 0 ? 0.9 : 1.1)));
+    };
+    cv.addEventListener("wheel", onWheel, { passive: false });
+    return () => cv.removeEventListener("wheel", onWheel);
+  }, [track]);
+
+  const byNum = useMemo(
+    () => new Map(drivers.map((d) => [d.driver_number, d])),
+    [drivers],
+  );
+
+  // ---- 60fps playback + draw loop (no React re-renders in here) ----
   useEffect(() => {
     let raf = 0;
     let lastWall: number | null = null;
@@ -316,7 +320,8 @@ export default function ReplayTab({
 
     const frame = (now: number) => {
       raf = requestAnimationFrame(frame);
-      const wallDt = lastWall == null ? 0 : now - lastWall;
+      // clamp so returning from a hidden tab doesn't teleport the playhead
+      const wallDt = lastWall == null ? 0 : Math.min(now - lastWall, 100);
       lastWall = now;
 
       if (playingRef.current) {
@@ -337,18 +342,60 @@ export default function ReplayTab({
 
       const chunk = locChunks.current.get(idx);
       const prevChunk = locChunks.current.get(idx - 1);
-      const tk = trackRef.current;
+      const model = trackRef.current;
+      const cv = canvasRef.current;
 
-      if (tk && chunk) {
-        for (const [dn, g] of dotRefs.current) {
-          const pos = samplePos(chunk.get(dn), prevChunk?.get(dn), t);
-          if (!pos) {
-            g.setAttribute("opacity", "0");
-            continue;
+      if (cv && model) {
+        const dpr = window.devicePixelRatio || 1;
+        const w = cv.clientWidth || 800;
+        if (cv.width !== Math.round(w * dpr) || cv.height !== CANVAS_H * dpr) {
+          cv.width = Math.round(w * dpr);
+          cv.height = CANVAS_H * dpr;
+        }
+        const ctx = cv.getContext("2d");
+        if (ctx) {
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.clearRect(0, 0, w, CANVAS_H);
+          const proj = makeProjector(camRef.current, w, CANVAS_H, model.R);
+          drawTrack(ctx, proj, model);
+
+          hitRef.current.clear();
+          if (chunk) {
+            const cars: {
+              dn: number;
+              world: { x: number; y: number; z: number };
+              stale: boolean;
+              depth: number;
+            }[] = [];
+            for (const d of drivers) {
+              const pos = samplePos(
+                chunk.get(d.driver_number),
+                prevChunk?.get(d.driver_number),
+                t,
+              );
+              if (!pos) continue;
+              const world = model.toWorld(pos.x, pos.y, pos.z);
+              cars.push({
+                dn: d.driver_number,
+                world,
+                stale: pos.stale,
+                depth: proj.depth(world),
+              });
+            }
+            cars.sort((a, b) => b.depth - a.depth); // far first
+            const fdn = focusRef.current;
+            for (const c of cars) {
+              const d = byNum.get(c.dn);
+              const color = teamColor(d?.team_colour);
+              if (c.dn === fdn) drawBeacon(ctx, proj, c.world, color, now);
+              const sp = drawCar(ctx, proj, c.world, color, {
+                label: labelsRef.current ? d?.name_acronym : undefined,
+                alpha: c.stale ? 0.2 : 1,
+                focused: c.dn === fdn,
+              });
+              hitRef.current.set(c.dn, sp);
+            }
           }
-          const [sx, sy] = tk.toSvg(pos.x, pos.y);
-          g.setAttribute("transform", `translate(${sx},${sy})`);
-          g.setAttribute("opacity", pos.stale ? "0.2" : "1");
         }
       }
 
@@ -390,7 +437,7 @@ export default function ReplayTab({
 
     raf = requestAnimationFrame(frame);
     return () => cancelAnimationFrame(raf);
-  }, [t0, t1, loadLocChunk, loadCarChunk]);
+  }, [t0, t1, drivers, byNum, loadLocChunk, loadCarChunk]);
 
   // ---- leaderboard at the playhead (4Hz is plenty) ----
   const sortedPositions = useMemo(
@@ -469,79 +516,59 @@ export default function ReplayTab({
         ))}
       </div>
 
-      {/* track map + controls */}
+      {/* 3D track + controls */}
       <div className="rounded-xl border border-line bg-surface p-3">
         <div className="relative">
-          <svg viewBox={track.vb} className="w-full">
-            <path
-              d={track.path}
-              fill="none"
-              stroke="#2e2e3a"
-              strokeWidth={14}
-              strokeLinejoin="round"
-              strokeLinecap="round"
-            />
-            <path
-              d={track.path}
-              fill="none"
-              stroke="#55556a"
-              strokeWidth={1.5}
-              strokeDasharray="5 9"
-              opacity={0.5}
-            />
-            <circle
-              cx={track.sf[0]}
-              cy={track.sf[1]}
-              r={5}
-              fill="#e10600"
-              stroke="#0a0a0f"
-            />
-            {drivers.map((d) => (
-              <g
-                key={d.driver_number}
-                opacity={0}
-                ref={(el) => {
-                  if (el) dotRefs.current.set(d.driver_number, el);
-                  else dotRefs.current.delete(d.driver_number);
-                }}
-                onClick={() =>
-                  setFocus(
-                    focus === d.driver_number ? null : d.driver_number,
-                  )
+          <canvas
+            ref={canvasRef}
+            style={{ height: CANVAS_H, touchAction: "none" }}
+            className="w-full cursor-grab active:cursor-grabbing"
+            onPointerDown={(e) => {
+              (e.target as HTMLElement).setPointerCapture(e.pointerId);
+              dragRef.current = { x: e.clientX, y: e.clientY, moved: false };
+            }}
+            onPointerMove={(e) => {
+              const drag = dragRef.current;
+              if (!drag) return;
+              const dx = e.clientX - drag.x;
+              const dy = e.clientY - drag.y;
+              if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
+              drag.x = e.clientX;
+              drag.y = e.clientY;
+              const c = camRef.current;
+              c.yaw += dx * 0.006;
+              c.pitch = Math.min(1.25, Math.max(0, c.pitch + dy * 0.005));
+            }}
+            onPointerUp={(e) => {
+              const drag = dragRef.current;
+              dragRef.current = null;
+              if (drag?.moved) return;
+              // click: focus the nearest car
+              const rect = (e.target as HTMLElement).getBoundingClientRect();
+              const mx = e.clientX - rect.left;
+              const my = e.clientY - rect.top;
+              let best: number | null = null;
+              let bestD = 16;
+              for (const [dn, [sx, sy]] of hitRef.current) {
+                const d = Math.hypot(sx - mx, sy - my);
+                if (d < bestD) {
+                  bestD = d;
+                  best = dn;
                 }
-                className="cursor-pointer"
-              >
-                {focus === d.driver_number && (
-                  <circle r={12} fill="none" stroke="#ffffff" strokeWidth={2} />
-                )}
-                <circle
-                  r={7}
-                  fill={teamColor(d.team_colour)}
-                  stroke="#0a0a0f"
-                  strokeWidth={1.5}
-                />
-                {showLabels && (
-                  <text
-                    x={10}
-                    y={4}
-                    fontSize={11}
-                    fontWeight={600}
-                    fill="#e2e2ea"
-                    style={{ paintOrder: "stroke", stroke: "#0a0a0f", strokeWidth: 3 }}
-                  >
-                    {d.name_acronym}
-                  </text>
-                )}
-              </g>
-            ))}
-          </svg>
+              }
+              if (best != null) setFocus(focus === best ? null : best);
+            }}
+          />
           {buffering && (
-            <div className="absolute inset-0 flex items-center justify-center">
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
               <span className="animate-pulse rounded-md bg-background/80 px-3 py-1.5 text-xs text-muted">
                 Buffering GPS data…
               </span>
             </div>
           )}
+          <div className="pointer-events-none absolute left-2 top-2 rounded bg-background/70 px-2 py-1 text-[10px] text-muted">
+            drag to rotate · scroll to zoom
+          </div>
         </div>
 
         <div className="mt-2 flex flex-wrap items-center gap-3 border-t border-line pt-3">
@@ -582,7 +609,34 @@ export default function ReplayTab({
           <span className="font-mono text-xs text-muted">
             {fmtClock(clock)} / {fmtClock(durationS)}
           </span>
-          <label className="flex items-center gap-1.5 text-xs text-muted">
+        </div>
+
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+          <button
+            onClick={() => {
+              camRef.current.pitch = 0;
+            }}
+            className="rounded border border-line px-2 py-1 text-muted hover:text-foreground"
+          >
+            Top-down
+          </button>
+          <button
+            onClick={() => {
+              camRef.current.pitch = DEFAULT_PITCH;
+            }}
+            className="rounded border border-line px-2 py-1 text-muted hover:text-foreground"
+          >
+            3D
+          </button>
+          <button
+            onClick={() => {
+              camRef.current = { yaw: 0, pitch: DEFAULT_PITCH, zoom: 1 };
+            }}
+            className="rounded border border-line px-2 py-1 text-muted hover:text-foreground"
+          >
+            Reset view
+          </button>
+          <label className="ml-auto flex items-center gap-1.5 text-muted">
             <input
               type="checkbox"
               checked={showLabels}
@@ -703,7 +757,7 @@ export default function ReplayTab({
         ) : (
           <p className="py-6 text-center text-xs text-muted">
             Click a car on the map or a row in the position tower to see its
-            live telemetry.
+            live telemetry. The focused car gets a light beacon.
           </p>
         )}
       </div>

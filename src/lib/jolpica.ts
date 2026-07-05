@@ -7,7 +7,7 @@ import type {
 const BASE = "https://api.jolpi.ca/ergast/f1";
 
 interface ScheduleResponse {
-  MRData: { RaceTable?: { Races?: JRace[] } };
+  MRData: { total?: string; RaceTable?: { Races?: JRace[] } };
 }
 
 interface StandingsResponse {
@@ -78,6 +78,56 @@ export async function getQualifying(
     3600,
   );
   return j?.MRData.RaceTable?.Races?.[0] ?? null;
+}
+
+/**
+ * Season-wide result sets ("2026/qualifying") span multiple pages — Jolpica
+ * caps limit at 100 — and a page boundary can split a race, so merge each
+ * page's races by round.
+ */
+async function jolpicaPaged(pathBase: string): Promise<JRace[]> {
+  const limit = 100;
+  const byRound = new Map<string, JRace>();
+  for (let page = 0; page < 12; page++) {
+    const offset = page * limit;
+    const j = await jolpica<ScheduleResponse>(
+      `${pathBase}.json?limit=${limit}&offset=${offset}`,
+      3600,
+    );
+    if (!j) break;
+    for (const r of j.MRData.RaceTable?.Races ?? []) {
+      const ex = byRound.get(r.round);
+      if (!ex) {
+        byRound.set(r.round, {
+          ...r,
+          Results: r.Results ? [...r.Results] : undefined,
+          QualifyingResults: r.QualifyingResults
+            ? [...r.QualifyingResults]
+            : undefined,
+        });
+      } else {
+        if (r.Results) ex.Results = [...(ex.Results ?? []), ...r.Results];
+        if (r.QualifyingResults) {
+          ex.QualifyingResults = [
+            ...(ex.QualifyingResults ?? []),
+            ...r.QualifyingResults,
+          ];
+        }
+      }
+    }
+    if (offset + limit >= Number(j.MRData.total ?? 0)) break;
+  }
+  return [...byRound.values()].sort(
+    (a, b) => Number(a.round) - Number(b.round),
+  );
+}
+
+export function getSeasonQualifying(year: string | number): Promise<JRace[]> {
+  return jolpicaPaged(`${year}/qualifying`);
+}
+
+export function getSeasonResults(year: string | number): Promise<JRace[]> {
+  return jolpicaPaged(`${year}/results`);
 }
 
 export async function getLastRaceResults(): Promise<JRace | null> {

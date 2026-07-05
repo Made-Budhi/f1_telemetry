@@ -8,6 +8,10 @@ import LapChart from "@/components/LapChart";
 import TelemetryTab from "@/components/TelemetryTab";
 import StintChart from "@/components/StintChart";
 import ReplayTab from "@/components/ReplayTab";
+import GhostTab from "@/components/GhostTab";
+import StrategyTab from "@/components/StrategyTab";
+import RaceControlTab from "@/components/RaceControlTab";
+import WeatherTab from "@/components/WeatherTab";
 import { useApi } from "@/lib/useApi";
 import { fmtDate } from "@/lib/format";
 import type {
@@ -21,9 +25,13 @@ import type {
 const TABS = [
   ["timing", "Timing"],
   ["replay", "Replay"],
+  ["ghost", "Ghost Race"],
   ["laps", "Lap Times"],
   ["telemetry", "Telemetry"],
   ["stints", "Stints"],
+  ["strategy", "Strategy"],
+  ["control", "Race Control"],
+  ["weather", "Weather"],
 ] as const;
 type TabKey = (typeof TABS)[number][0];
 
@@ -130,7 +138,7 @@ export default function TelemetryPage() {
                 max={4}
               />
 
-              <div className="flex gap-1 border-b border-line">
+              <div className="flex gap-1 overflow-x-auto border-b border-line whitespace-nowrap">
                 {TABS.map(([key, label]) => (
                   <button
                     key={key}
@@ -173,9 +181,24 @@ export default function TelemetryPage() {
                   positions={positions.data ?? []}
                 />
               )}
+              {tab === "ghost" &&
+                (selectedDrivers.length ? (
+                  <GhostTab
+                    key={session.session_key}
+                    session={session}
+                    drivers={selectedDrivers}
+                    laps={laps.data}
+                  />
+                ) : (
+                  <Hint text="Select at least one driver above." />
+                ))}
               {tab === "laps" &&
                 (selectedDrivers.length ? (
-                  <LapChart drivers={selectedDrivers} laps={laps.data} />
+                  <LapChart
+                    drivers={selectedDrivers}
+                    laps={laps.data}
+                    sessionType={session.session_type}
+                  />
                 ) : (
                   <Hint text="Select at least one driver above." />
                 ))}
@@ -196,6 +219,19 @@ export default function TelemetryPage() {
                   positions={positions.data ?? []}
                 />
               )}
+              {tab === "strategy" && (
+                <StrategyTab
+                  session={session}
+                  drivers={drivers.data}
+                  laps={laps.data}
+                  stints={stints.data ?? []}
+                  positions={positions.data ?? []}
+                />
+              )}
+              {tab === "control" && (
+                <RaceControlTab session={session} drivers={drivers.data} />
+              )}
+              {tab === "weather" && <WeatherTab session={session} />}
             </>
           )}
         </>

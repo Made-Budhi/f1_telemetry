@@ -12,14 +12,22 @@ import {
 } from "@/lib/format";
 import type { Driver, Lap } from "@/lib/types";
 
+// Rough fuel-burn effect: an F1 car laps ~0.055s quicker per lap of fuel
+// burned, so subtracting it exposes true pace and tyre degradation.
+const FUEL_EFFECT_S_PER_LAP = 0.055;
+
 export default function LapChart({
   drivers,
   laps,
+  sessionType,
 }: {
   drivers: Driver[];
   laps: Lap[];
+  sessionType?: string;
 }) {
   const [hideOutliers, setHideOutliers] = useState(true);
+  const [fuelCorrect, setFuelCorrect] = useState(false);
+  const isRace = sessionType === "Race";
   const colors = useMemo(() => buildColorMap(drivers), [drivers]);
 
   const { data, options, empty } = useMemo(() => {
@@ -54,7 +62,10 @@ export default function LapChart({
         ) {
           continue;
         }
-        y[l.lap_number - 1] = l.lap_duration;
+        y[l.lap_number - 1] =
+          fuelCorrect && isRace
+            ? l.lap_duration - (maxLap - l.lap_number) * FUEL_EFFECT_S_PER_LAP
+            : l.lap_duration;
       }
       return y;
     });
@@ -101,21 +112,37 @@ export default function LapChart({
       options,
       empty,
     };
-  }, [drivers, laps, hideOutliers, colors]);
+  }, [drivers, laps, hideOutliers, fuelCorrect, isRace, colors]);
 
   return (
     <div className="rounded-xl border border-line bg-surface p-4">
       <div className="mb-3 flex items-center justify-between">
         <h3 className="text-sm font-medium">Lap time comparison</h3>
-        <label className="flex items-center gap-2 text-xs text-muted">
-          <input
-            type="checkbox"
-            checked={hideOutliers}
-            onChange={(e) => setHideOutliers(e.target.checked)}
-            className="accent-(--accent)"
-          />
-          Hide pit &amp; outlier laps
-        </label>
+        <div className="flex items-center gap-4">
+          {isRace && (
+            <label
+              className="flex items-center gap-2 text-xs text-muted"
+              title={`Subtracts ~${FUEL_EFFECT_S_PER_LAP}s per lap of fuel still on board to expose true pace`}
+            >
+              <input
+                type="checkbox"
+                checked={fuelCorrect}
+                onChange={(e) => setFuelCorrect(e.target.checked)}
+                className="accent-(--accent)"
+              />
+              Fuel-corrected
+            </label>
+          )}
+          <label className="flex items-center gap-2 text-xs text-muted">
+            <input
+              type="checkbox"
+              checked={hideOutliers}
+              onChange={(e) => setHideOutliers(e.target.checked)}
+              className="accent-(--accent)"
+            />
+            Hide pit &amp; outlier laps
+          </label>
+        </div>
       </div>
       {empty ? (
         <p className="py-10 text-center text-sm text-muted">
